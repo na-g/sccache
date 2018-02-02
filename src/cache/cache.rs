@@ -18,12 +18,18 @@ use app_dirs::{
     app_dir,
 };
 use cache::disk::DiskCache;
+#[cfg(feature = "memcached")]
+use cache::memcached::MemcachedCache;
 #[cfg(feature = "redis")]
 use cache::redis::RedisCache;
 #[cfg(feature = "s3")]
 use cache::s3::S3Cache;
+#[cfg(feature = "gcs")]
+use cache::gcs::{self, GCSCache, GCSCredentialProvider, RWMode};
 use futures_cpupool::CpuPool;
 use regex::Regex;
+#[cfg(feature = "gcs")]
+use serde_json;
 use std::env;
 use std::fmt;
 use std::io::{
@@ -32,6 +38,8 @@ use std::io::{
     Seek,
     Write,
 };
+#[cfg(feature = "gcs")]
+use std::fs::File;
 use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -48,7 +56,7 @@ const APP_INFO: AppInfo = AppInfo {
     author: "Mozilla",
 };
 
-const TEN_GIGS: usize = 10 * 1024 * 1024 * 1024;
+const TEN_GIGS: u64 = 10 * 1024 * 1024 * 1024;
 
 /// Result of a cache lookup.
 pub enum Cache {
@@ -154,31 +162,32 @@ pub trait Storage {
     /// return a `Cache::Hit`.
     fn get(&self, key: &str) -> SFuture<Cache>;
 
-    /// Get a cache entry for `key` that can be filled with data.
-    fn start_put(&self, key: &str) -> Result<CacheWrite>;
-
     /// Put `entry` in the cache under `key`.
     ///
     /// Returns a `Future` that will provide the result or error when the put is
     /// finished.
-    fn finish_put(&self, key: &str, entry: CacheWrite) -> SFuture<Duration>;
+    fn put(&self, key: &str, entry: CacheWrite) -> SFuture<Duration>;
 
     /// Get the storage location.
     fn location(&self) -> String;
 
     /// Get the current storage usage, if applicable.
-    fn current_size(&self) -> Option<usize>;
+    fn current_size(&self) -> Option<u64>;
 
     /// Get the maximum storage size, if applicable.
-    fn max_size(&self) -> Option<usize>;
+    fn max_size(&self) -> Option<u64>;
 }
 
-fn parse_size(val: &str) -> Option<usize> {
+fn parse_size(val: &str) -> Option<u64> {
     let re = Regex::new(r"^(\d+)([KMGT])$").unwrap();
     re.captures(val)
-        .and_then(|caps| caps.at(1).and_then(|size| usize::from_str(size).ok()).and_then(|size| Some((size, caps.at(2)))))
+        .and_then(|caps| {
+            caps.get(1)
+                .and_then(|size| u64::from_str(size.as_str()).ok())
+                .and_then(|size| Some((size, caps.get(2))))
+        })
         .and_then(|(size, suffix)| {
-            match suffix {
+            match suffix.map(|s| s.as_str()) {
                 Some("K") => Some(1024 * size),
                 Some("M") => Some(1024 * 1024 * size),
                 Some("G") => Some(1024 * 1024 * 1024 * size),
@@ -226,13 +235,88 @@ pub fn storage_from_environment(pool: &CpuPool, _handle: &Handle) -> Arc<Storage
         }
     }
 
+    if cfg!(feature = "memcached") {
+        if let Ok(url) = env::var("SCCACHE_MEMCACHED") {
+            debug!("Trying Memcached({})", url);
+            #[cfg(feature = "memcached")]
+            match MemcachedCache::new(&url, pool) {
+                Ok(s) => {
+                    trace!("Using Memcached: {}", url);
+                    return Arc::new(s);
+                }
+                Err(e) => warn!("Failed to create MemcachedCache: {:?}", e),
+            }
+        }
+    }
+
+    if cfg!(feature = "gcs") {
+        if let Ok(bucket) = env::var("SCCACHE_GCS_BUCKET")
+        {
+            debug!("Trying GCS bucket({})", bucket);
+            #[cfg(feature = "gcs")]
+            {
+                let cred_path_res = env::var("SCCACHE_GCS_KEY_PATH");
+                if cred_path_res.is_err() {
+                    warn!("No SCCACHE_GCS_KEY_PATH specified-- no authentication will be used.");
+                }
+
+                let service_account_key_opt: Option<gcs::ServiceAccountKey> =
+                    if let Ok(cred_path) = cred_path_res
+                {
+                    // Attempt to read the service account key from file
+                    let service_account_key_res: Result<gcs::ServiceAccountKey> = (|| {
+                        let mut file = File::open(&cred_path)?;
+                        let mut service_account_json = String::new();
+                        file.read_to_string(&mut service_account_json)?;
+                        Ok(serde_json::from_str(&service_account_json)?)
+                    })();
+
+                    // warn! if an error was encountered reading the key from the file
+                    if let Err(ref e) = service_account_key_res {
+                        warn!("Failed to parse service account credentials from file: {:?}. \
+                            Continuing without authentication.", e);
+                    }
+
+                    service_account_key_res.ok()
+                } else { None };
+
+                let gcs_read_write_mode = match env::var("SCCACHE_GCS_RW_MODE")
+                                          .as_ref().map(String::as_str)
+                {
+                    Ok("READ_ONLY") => RWMode::ReadOnly,
+                    Ok("READ_WRITE") => RWMode::ReadWrite,
+                    Ok(_) => {
+                        warn!("Invalid SCCACHE_GCS_RW_MODE-- defaulting to READ_ONLY.");
+                        RWMode::ReadOnly
+                    },
+                    _ => {
+                        warn!("No SCCACHE_GCS_RW_MODE specified-- defaulting to READ_ONLY.");
+                        RWMode::ReadOnly
+                    }
+                };
+
+                let gcs_cred_provider =
+                    service_account_key_opt.map(|path|
+                        GCSCredentialProvider::new(gcs_read_write_mode, path));
+
+                match GCSCache::new(bucket, gcs_cred_provider, gcs_read_write_mode, _handle) {
+                    Ok(s) => {
+                        trace!("Using GCSCache");
+                        return Arc::new(s);
+                    }
+                    Err(e) => warn!("Failed to create GCS Cache: {:?}", e),
+                }
+            }
+        }
+    }
+
     let d = env::var_os("SCCACHE_DIR")
         .map(|p| PathBuf::from(p))
         .or_else(|| app_dir(AppDataType::UserCache, &APP_INFO, "").ok())
         // Fall back to something, even if it's not very good.
         .unwrap_or(env::temp_dir().join("sccache_cache"));
     trace!("Using DiskCache({:?})", d);
-    let cache_size = env::var("SCCACHE_CACHE_SIZE")
+    let cache_size: u64 = env::var("SCCACHE_CACHE_SIZE")
         .ok()
         .and_then(|v| parse_size(&v))
         .unwrap_or(TEN_GIGS);

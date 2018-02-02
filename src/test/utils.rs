@@ -21,16 +21,25 @@ use std::ffi::OsString;
 use std::fs::{self,File};
 use std::io;
 use std::path::{Path,PathBuf};
-use std::process;
 
 use std::sync::{Arc,Mutex};
 use tempdir::TempDir;
 use tokio_core::reactor::Core;
 
+use jobserver::Client;
+use errors::*;
+
 /// Return a `Vec` with each listed entry converted to an owned `String`.
 macro_rules! stringvec {
     ( $( $x:expr ),* ) => {
         vec!($( $x.to_owned(), )*)
+    };
+}
+
+/// Return a `Vec` with each listed entry converted to an owned `OsString`.
+macro_rules! ovec {
+    ( $( $x:expr ),* ) => {
+        vec!($( ::std::ffi::OsString::from($x), )*)
     };
 }
 
@@ -63,15 +72,16 @@ macro_rules! assert_map_contains {
 
 pub fn new_creator() -> Arc<Mutex<MockCommandCreator>> {
     let core = Core::new().unwrap();
-    Arc::new(Mutex::new(MockCommandCreator::new(&core.handle())))
+    let client = unsafe { Client::new() };
+    Arc::new(Mutex::new(MockCommandCreator::new(&core.handle(), &client)))
 }
 
 pub fn next_command(creator : &Arc<Mutex<MockCommandCreator>>,
-                child: io::Result<MockChild>) {
+                    child: Result<MockChild>) {
     creator.lock().unwrap().next_command_spawns(child);
 }
 
-pub fn next_command_calls<C: Fn(&[OsString]) -> io::Result<MockChild> + Send + 'static>(creator: &Arc<Mutex<MockCommandCreator>>, call: C) {
+pub fn next_command_calls<C: Fn(&[OsString]) -> Result<MockChild> + Send + 'static>(creator: &Arc<Mutex<MockCommandCreator>>, call: C) {
     creator.lock().unwrap().next_command_calls(call);
 }
 
@@ -101,7 +111,9 @@ pub struct TestFixture {
 pub const SUBDIRS: &'static [&'static str] = &["a", "b", "c"];
 pub const BIN_NAME: &'static str = "bin";
 
-pub fn create_file<F : FnOnce(File) -> io::Result<()>>(dir: &Path, path: &str, fill_contents: F) -> io::Result<PathBuf> {
+pub fn create_file<F>(dir: &Path, path: &str, fill_contents: F) -> io::Result<PathBuf>
+    where F: FnOnce(File) -> io::Result<()>
+{
     let b = dir.join(path);
     let parent = b.parent().unwrap();
     fs::create_dir_all(&parent)?;
@@ -176,14 +188,6 @@ impl TestFixture {
     }
 }
 
-
-pub fn empty_output() -> process::Output {
-    process::Output {
-        stdout: Vec::new(),
-        stderr: Vec::new(),
-        status: exit_status(0),
-    }
-}
 
 #[test]
 fn test_map_contains_ok() {

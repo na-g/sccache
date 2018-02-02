@@ -18,7 +18,6 @@ use cache::{
     CacheWrite,
     Storage,
 };
-use futures::Future;
 use futures_cpupool::CpuPool;
 use lru_disk_cache::LruDiskCache;
 use lru_disk_cache::Error as LruError;
@@ -41,7 +40,7 @@ pub struct DiskCache {
 impl DiskCache {
     /// Create a new `DiskCache` rooted at `root`, with `max_size` as the maximum cache size on-disk, in bytes.
     pub fn new<T: AsRef<OsStr>>(root: &T,
-                                max_size: usize,
+                                max_size: u64,
                                 pool: &CpuPool) -> DiskCache {
         DiskCache {
             //TODO: change this function to return a Result
@@ -62,7 +61,7 @@ impl Storage for DiskCache {
         let path = make_key_path(key);
         let lru = self.lru.clone();
         let key = key.to_owned();
-        self.pool.spawn_fn(move || {
+        Box::new(self.pool.spawn_fn(move || {
             let mut lru = lru.lock().unwrap();
             let f = match lru.get(&path) {
                 Ok(f) => f,
@@ -78,32 +77,27 @@ impl Storage for DiskCache {
             };
             let hit = CacheRead::from(f)?;
             Ok(Cache::Hit(hit))
-        }).boxed()
+        }))
     }
 
-    fn start_put(&self, key: &str) -> Result<CacheWrite> {
-        trace!("DiskCache::start_put({})", key);
-        Ok(CacheWrite::new())
-    }
-
-    fn finish_put(&self, key: &str, entry: CacheWrite) -> SFuture<Duration> {
+    fn put(&self, key: &str, entry: CacheWrite) -> SFuture<Duration> {
         // We should probably do this on a background thread if we're going to buffer
         // everything in memory...
         trace!("DiskCache::finish_put({})", key);
         let lru = self.lru.clone();
         let key = make_key_path(key);
-        self.pool.spawn_fn(move || {
+        Box::new(self.pool.spawn_fn(move || {
             let start = Instant::now();
             let v = entry.finish()?;
             lru.lock().unwrap().insert_bytes(key, &v)?;
             Ok(start.elapsed())
-        }).boxed()
+        }))
     }
 
     fn location(&self) -> String {
         format!("Local disk: {:?}", self.lru.lock().unwrap().path())
     }
 
-    fn current_size(&self) -> Option<usize> { Some(self.lru.lock().unwrap().size()) }
-    fn max_size(&self) -> Option<usize> { Some(self.lru.lock().unwrap().capacity()) }
+    fn current_size(&self) -> Option<u64> { Some(self.lru.lock().unwrap().size()) }
+    fn max_size(&self) -> Option<u64> { Some(self.lru.lock().unwrap().capacity()) }
 }

@@ -1,8 +1,9 @@
-extern crate env_logger;
 extern crate filetime;
 #[macro_use]
 extern crate log;
-extern crate lru_cache;
+//extern crate lru_cache;
+extern crate linked_hash_map;
+mod lru_cache;
 extern crate walkdir;
 
 #[cfg(test)]
@@ -127,7 +128,7 @@ impl LruDiskCache {
     ///
     /// The cache is not observant of changes to files under `path` from external sources, it
     /// expects to have sole maintence of the contents.
-    pub fn new<T>(path: T, size: usize) -> Result<Self>
+    pub fn new<T>(path: T, size: u64) -> Result<Self>
         where PathBuf: From<T>
     {
         LruDiskCache {
@@ -137,10 +138,10 @@ impl LruDiskCache {
     }
 
     /// Return the current size of all the files in the cache.
-    pub fn size(&self) -> usize { self.lru.size() }
+    pub fn size(&self) -> u64 { self.lru.size() }
 
     /// Return the maximum size of the cache.
-    pub fn capacity(&self) -> usize { self.lru.capacity() }
+    pub fn capacity(&self) -> u64 { self.lru.capacity() }
 
     /// Return the path in which the cache is stored.
     pub fn path(&self) -> &Path { self.root.as_path() }
@@ -270,7 +271,7 @@ mod tests {
     fn set_mtime_back<T: AsRef<Path>>(path: T, seconds: usize) {
         let m = fs::metadata(path.as_ref()).unwrap();
         let t = FileTime::from_last_modification_time(&m);
-        let t = FileTime::from_seconds_since_1970(t.seconds() - seconds as u64, t.nanoseconds());
+        let t = FileTime::from_seconds_since_1970(t.seconds_relative_to_1970() - seconds as u64, t.nanoseconds());
         set_file_times(path, t, t).unwrap();
     }
 
@@ -318,8 +319,9 @@ mod tests {
     #[test]
     fn test_existing_file_too_large() {
         let f = TestFixture::new();
-        f.create_file("file1", 10);
-        f.create_file("file2", 10);
+        // Create files explicitly in the past.
+        set_mtime_back(f.create_file("file1", 10), 10);
+        set_mtime_back(f.create_file("file2", 10), 5);
         let c = LruDiskCache::new(f.tmp(), 15).unwrap();
         assert_eq!(c.size(), 10);
         assert!(!c.contains_key("file1"));

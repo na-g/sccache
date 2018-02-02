@@ -18,7 +18,7 @@ use cache::{
     CacheWrite,
     Storage,
 };
-use futures::future::{self, Future};
+use futures::future::Future;
 use simples3::{
     AutoRefreshingProvider,
     Bucket,
@@ -56,7 +56,7 @@ impl S3Cache {
         ];
         let provider = AutoRefreshingProvider::new(ChainProvider::with_profile_providers(profile_providers, handle));
         //TODO: configurable SSL
-        let bucket = Rc::new(Bucket::new(bucket, endpoint, Ssl::No, handle));
+        let bucket = Rc::new(Bucket::new(bucket, endpoint, Ssl::No, handle)?);
         Ok(S3Cache {
             bucket: bucket,
             provider: provider,
@@ -85,17 +85,12 @@ impl Storage for S3Cache {
         }))
     }
 
-    fn start_put(&self, _key: &str) -> Result<CacheWrite> {
-        // Just hand back an in-memory buffer.
-        Ok(CacheWrite::new())
-    }
-
-    fn finish_put(&self, key: &str, entry: CacheWrite) -> SFuture<Duration> {
+    fn put(&self, key: &str, entry: CacheWrite) -> SFuture<Duration> {
         let key = normalize_key(&key);
         let start = Instant::now();
         let data = match entry.finish() {
             Ok(data) => data,
-            Err(e) => return future::err(e.into()).boxed(),
+            Err(e) => return f_err(e),
         };
         let credentials = self.provider.credentials().chain_err(|| {
             "failed to get AWS credentials"
@@ -115,6 +110,6 @@ impl Storage for S3Cache {
         format!("S3, bucket: {}", self.bucket)
     }
 
-    fn current_size(&self) -> Option<usize> { None }
-    fn max_size(&self) -> Option<usize> { None }
+    fn current_size(&self) -> Option<u64> { None }
+    fn max_size(&self) -> Option<u64> { None }
 }

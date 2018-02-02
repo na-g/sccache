@@ -24,6 +24,7 @@ use ::commands::{
 use env_logger;
 use futures::sync::oneshot::{self, Sender};
 use futures_cpupool::CpuPool;
+use jobserver::Client;
 use ::mock_command::*;
 use ::server::{
     ServerMessage,
@@ -40,7 +41,7 @@ use std::process::Command;
 use std::sync::{Arc,Mutex,mpsc};
 use std::thread;
 use std::time::Duration;
-use std::usize;
+use std::u64;
 use test::utils::*;
 use tokio_core::reactor::Core;
 
@@ -50,7 +51,7 @@ struct ServerOptions {
     /// The server's idle shutdown timeout.
     idle_timeout: Option<u64>,
     /// The maximum size of the disk cache.
-    cache_size: Option<usize>,
+    cache_size: Option<u64>,
 }
 
 /// Run a server on a background thread, and return a tuple of useful things.
@@ -71,7 +72,7 @@ fn run_server_thread<T>(cache_dir: &Path, options: T)
     let cache_size = options.as_ref()
                             .and_then(|o| o.cache_size.as_ref())
                             .map(|s| *s)
-                            .unwrap_or(usize::MAX);
+                            .unwrap_or(u64::MAX);
     let pool = CpuPool::new(1);
     let storage = Arc::new(DiskCache::new(&cache_dir, cache_size, &pool));
 
@@ -80,7 +81,8 @@ fn run_server_thread<T>(cache_dir: &Path, options: T)
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
     let handle = thread::spawn(move || {
         let core = Core::new().unwrap();
-        let srv = SccacheServer::new(0, pool, core, storage).unwrap();
+        let client = unsafe { Client::new() };
+        let srv = SccacheServer::new(0, pool, core, client, storage).unwrap();
         let mut srv: SccacheServer<Arc<Mutex<MockCommandCreator>>> = srv;
         assert!(srv.port() > 0);
         if let Some(options) = options {
@@ -106,6 +108,24 @@ fn test_server_shutdown() {
     // Ask it to shut down
     request_shutdown(conn).unwrap();
     // Ensure that it shuts down.
+    child.join().unwrap();
+}
+
+/// The server will shutdown when requested when the idle timeout is disabled.
+#[test]
+fn test_server_shutdown_no_idle() {
+    let f = TestFixture::new();
+    // Set a ridiculously low idle timeout.
+    let (port, _sender, _storage, child) = run_server_thread(
+        &f.tempdir.path(),
+        ServerOptions {
+            idle_timeout: Some(0),
+            ..Default::default()
+        },
+    );
+
+    let conn = connect_to_server(port).unwrap();
+    request_shutdown(conn).unwrap();
     child.join().unwrap();
 }
 
@@ -202,11 +222,9 @@ fn test_server_compile() {
         let obj = f.tempdir.path().join("file.o");
         c.next_command_calls(move |_| {
             // Pretend to compile something.
-            match File::create(&obj)
-                .and_then(|mut f| f.write_all(b"file contents")) {
-                    Ok(_) => Ok(MockChild::new(exit_status(0), STDOUT, STDERR)),
-                    Err(e) => Err(e),
-                }
+            let mut f = File::create(&obj)?;
+            f.write_all(b"file contents")?;
+            Ok(MockChild::new(exit_status(0), STDOUT, STDERR))
         });
     }
     // Ask the server to compile something.

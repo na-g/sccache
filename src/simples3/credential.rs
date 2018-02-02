@@ -10,6 +10,7 @@ use hyper::client::{HttpConnector, Request};
 use hyper::header::Connection;
 use regex::Regex;
 use serde_json::{Value, from_str};
+#[allow(unused_imports)]
 use std::ascii::AsciiExt;
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -87,7 +88,7 @@ pub struct EnvironmentProvider;
 
 impl ProvideAwsCredentials for EnvironmentProvider {
     fn credentials(&self) -> SFuture<AwsCredentials> {
-		future::result(credentials_from_environment()).boxed()
+		Box::new(future::result(credentials_from_environment()))
     }
 }
 
@@ -189,7 +190,7 @@ impl ProvideAwsCredentials for ProfileProvider {
         let result = result.and_then(|mut profiles| {
             profiles.remove(self.profile()).ok_or("profile not found".into())
         });
-        future::result(result).boxed()
+        Box::new(future::result(result))
     }
 }
 
@@ -231,7 +232,7 @@ fn parse_credentials_file(file_path: &Path) -> Result<HashMap<String, AwsCredent
             secret_key = None;
 
             let caps = profile_regex.captures(&unwrapped_line).unwrap();
-            profile_name = Some(caps.at(1).unwrap().to_string());
+            profile_name = Some(caps.get(1).unwrap().as_str().to_string());
             continue;
         }
 

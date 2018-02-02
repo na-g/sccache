@@ -31,6 +31,7 @@ use futures::sync::mpsc;
 use futures::task::{self, Task};
 use futures::{Stream, Sink, Async, AsyncSink, Poll, StartSend, Future};
 use futures_cpupool::CpuPool;
+use jobserver::Client;
 use mock_command::{
     CommandCreatorSync,
     ProcessCommandCreator,
@@ -40,14 +41,16 @@ use protocol::{Compile, CompileFinished, CompileResponse, Request, Response};
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::env;
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::fs::metadata;
 use std::io::{self, Write};
 use std::net::{SocketAddr, SocketAddrV4, Ipv4Addr};
+use std::path::PathBuf;
 use std::process::{Output, ExitStatus};
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
+use std::u64;
 use tokio_core::net::TcpListener;
 use tokio_core::reactor::{Handle, Core, Timeout};
 use tokio_io::codec::length_delimited::Framed;
@@ -61,8 +64,17 @@ use util::fmt_duration_as_secs;
 
 use errors::*;
 
-/// If the server is idle for this many milliseconds, shut down.
-const DEFAULT_IDLE_TIMEOUT: u64 = 600_000;
+/// If the server is idle for this many seconds, shut down.
+const DEFAULT_IDLE_TIMEOUT: u64 = 600;
+
+/// Get the time the server should idle for before shutting down.
+fn get_idle_timeout() -> u64 {
+    // A value of 0 disables idle shutdown entirely.
+    env::var("SCCACHE_IDLE_TIMEOUT")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(DEFAULT_IDLE_TIMEOUT)
+}
 
 fn notify_server_startup_internal<W: Write>(mut w: W, success: bool) -> io::Result<()> {
     let data = [ if success { 0 } else { 1 }; 1];
@@ -110,10 +122,11 @@ fn get_signal(_status: ExitStatus) -> i32 {
 /// requests a shutdown.
 pub fn start_server(port: u16) -> Result<()> {
     trace!("start_server");
+    let client = unsafe { Client::new() };
     let core = Core::new()?;
     let pool = CpuPool::new(20);
     let storage = storage_from_environment(&pool, &core.handle());
-    let res = SccacheServer::<ProcessCommandCreator>::new(port, pool, core, storage);
+    let res = SccacheServer::<ProcessCommandCreator>::new(port, pool, core, client, storage);
     let notify = env::var_os("SCCACHE_STARTUP_NOTIFY");
     match res {
         Ok(srv) => {
@@ -141,6 +154,7 @@ impl<C: CommandCreatorSync> SccacheServer<C> {
     pub fn new(port: u16,
                pool: CpuPool,
                core: Core,
+               client: Client,
                storage: Arc<Storage>) -> Result<SccacheServer<C>> {
         let handle = core.handle();
         let addr = SocketAddrV4::new(Ipv4Addr::new(127, 0, 0, 1), port);
@@ -150,14 +164,19 @@ impl<C: CommandCreatorSync> SccacheServer<C> {
         // connections.
         let (tx, rx) = mpsc::channel(1);
         let (wait, info) = WaitUntilZero::new();
-        let service = SccacheService::new(storage, core.handle(), pool, tx, info);
+        let service = SccacheService::new(storage,
+                                          core.handle(),
+                                          &client,
+                                          pool,
+                                          tx,
+                                          info);
 
         Ok(SccacheServer {
             core: core,
             listener: listener,
             rx: rx,
             service: service,
-            timeout: Duration::from_millis(DEFAULT_IDLE_TIMEOUT),
+            timeout: Duration::from_secs(get_idle_timeout()),
             wait: wait,
         })
     }
@@ -166,12 +185,6 @@ impl<C: CommandCreatorSync> SccacheServer<C> {
     #[allow(dead_code)]
     pub fn set_idle_timeout(&mut self, timeout: Duration) {
         self.timeout = timeout;
-    }
-
-    /// Set the `force_recache` setting.
-    #[allow(dead_code)]
-    pub fn set_force_recache(&mut self, force_recache: bool) {
-        self.service.force_recache = force_recache;
     }
 
     /// Set the storage this server will use.
@@ -235,29 +248,35 @@ impl<C: CommandCreatorSync> SccacheServer<C> {
         // inactivity, and this is then select'd with the `shutdown` future
         // passed to this function.
         let handle = core.handle();
-        let shutdown_idle = ShutdownOrInactive {
-            rx: rx,
-            timeout: Timeout::new(timeout, &handle)?,
-            handle: handle.clone(),
-            timeout_dur: timeout,
-        };
-        let shutdown_idle = shutdown_idle.map(|a| {
-            info!("shutting down due to being idle");
-            a
-        });
 
         let shutdown = shutdown.map(|a| {
             info!("shutting down due to explicit signal");
             a
         });
 
-        let server = future::select_all(vec![
+	let mut futures = vec![
             Box::new(server) as Box<Future<Item=_, Error=_>>,
-            Box::new(shutdown_idle),
             Box::new(shutdown.map_err(|()| {
                 io::Error::new(io::ErrorKind::Other, "shutdown signal failed")
             })),
-        ]);
+        ];
+
+        let shutdown_idle = ShutdownOrInactive {
+            rx: rx,
+            timeout: if timeout != Duration::new(0, 0) {
+                Some(Timeout::new(timeout, &handle)?)
+            } else {
+                None
+            },
+            handle: handle.clone(),
+            timeout_dur: timeout,
+        };
+        futures.push(Box::new(shutdown_idle.map(|a| {
+            info!("shutting down due to being idle or request");
+            a
+        })));
+
+        let server = future::select_all(futures);
         core.run(server)
             .map_err(|p| p.0)?;
 
@@ -290,12 +309,7 @@ struct SccacheService<C: CommandCreatorSync> {
     storage: Arc<Storage>,
 
     /// A cache of known compiler info.
-    compilers: Rc<RefCell<HashMap<String, Option<(Box<Compiler<C>>, FileTime)>>>>,
-
-    /// True if all compiles should be forced, ignoring existing cache entries.
-    ///
-    /// This can be controlled with the `SCCACHE_RECACHE` environment variable.
-    force_recache: bool,
+    compilers: Rc<RefCell<HashMap<PathBuf, Option<(Box<Compiler<C>>, FileTime)>>>>,
 
     /// Thread pool to execute work in
     pool: CpuPool,
@@ -385,6 +399,7 @@ impl<C> SccacheService<C>
 {
     pub fn new(storage: Arc<Storage>,
                handle: Handle,
+               client: &Client,
                pool: CpuPool,
                tx: mpsc::Sender<ServerMessage>,
                info: ActiveInfo) -> SccacheService<C> {
@@ -392,9 +407,8 @@ impl<C> SccacheService<C>
             stats: Rc::new(RefCell::new(ServerStats::default())),
             storage: storage,
             compilers: Rc::new(RefCell::new(HashMap::new())),
-            force_recache: env::var("SCCACHE_RECACHE").is_ok(),
             pool: pool,
-            creator: C::new(&handle),
+            creator: C::new(&handle, client),
             handle: handle,
             tx: tx,
             info: info,
@@ -430,14 +444,14 @@ impl<C> SccacheService<C>
         let cwd = compile.cwd;
         let env_vars = compile.env_vars;
         let me = self.clone();
-        Box::new(self.compiler_info(exe).map(move |info| {
-            me.check_compiler(info, cmd, cwd, env_vars)
+        Box::new(self.compiler_info(exe.into()).map(move |info| {
+            me.check_compiler(info, cmd, cwd.into(), env_vars)
         }))
     }
 
     /// Look up compiler info from the cache for the compiler `path`.
     /// If not cached, determine the compiler type and cache the result.
-    fn compiler_info(&self, path: String)
+    fn compiler_info(&self, path: PathBuf)
                      -> SFuture<Option<Box<Compiler<C>>>> {
         trace!("compiler_info");
         let mtime = ftry!(metadata(&path).map(|attr| FileTime::from_last_modification_time(&attr)));
@@ -477,8 +491,8 @@ impl<C> SccacheService<C>
     /// If so, run `start_compile_task` to execute it.
     fn check_compiler(&self,
                       compiler: Option<Box<Compiler<C>>>,
-                      cmd: Vec<String>,
-                      cwd: String,
+                      cmd: Vec<OsString>,
+                      cwd: PathBuf,
                       env_vars: Vec<(OsString, OsString)>) -> SccacheResponse
     {
         let mut stats = self.stats.borrow_mut();
@@ -491,9 +505,9 @@ impl<C> SccacheService<C>
                 debug!("check_compiler: Supported compiler");
                 // Now check that we can handle this compiler with
                 // the provided commandline.
-                match c.parse_arguments(&cmd, cwd.as_ref()) {
+                match c.parse_arguments(&cmd, &cwd) {
                     CompilerArguments::Ok(hasher) => {
-                        debug!("parse_arguments: Ok");
+                        debug!("parse_arguments: Ok: {:?}", cmd);
                         stats.requests_executed += 1;
                         let (tx, rx) = Body::pair();
                         self.start_compile_task(hasher, cmd, cwd, env_vars, tx);
@@ -502,11 +516,11 @@ impl<C> SccacheService<C>
                     }
                     CompilerArguments::CannotCache(why) => {
                         //TODO: save counts of why
-                        debug!("parse_arguments: CannotCache({})", why);
+                        debug!("parse_arguments: CannotCache({}): {:?}", why, cmd);
                         stats.requests_not_cacheable += 1;
                     }
                     CompilerArguments::NotCompilation => {
-                        debug!("parse_arguments: NotCompilation");
+                        debug!("parse_arguments: NotCompilation: {:?}", cmd);
                         stats.requests_not_compile += 1;
                     }
                 }
@@ -522,16 +536,19 @@ impl<C> SccacheService<C>
     /// the result in the cache.
     fn start_compile_task(&self,
                           hasher: Box<CompilerHasher<C>>,
-                          arguments: Vec<String>,
-                          cwd: String,
+                          arguments: Vec<OsString>,
+                          cwd: PathBuf,
                           env_vars: Vec<(OsString, OsString)>,
                           tx: mpsc::Sender<Result<Response>>) {
-        let cache_control = if self.force_recache {
+        let force_recache = env_vars.iter().any(|&(ref k, ref _v)| {
+            k.as_os_str() == OsStr::new("SCCACHE_RECACHE")
+        });
+        let cache_control = if force_recache {
             CacheControl::ForceRecache
         } else {
             CacheControl::Default
         };
-        let output = hasher.output_file().into_owned();
+        let out_pretty = hasher.output_pretty().into_owned();
         let result = hasher.get_cached_or_compile(self.creator.clone(),
                                                   self.storage.clone(),
                                                   arguments,
@@ -557,18 +574,18 @@ impl<C> SccacheService<C>
                         },
                         CompileResult::CacheMiss(miss_type, duration, future) => {
                             match miss_type {
-                                MissType::Normal => {
-                                    stats.cache_misses += 1;
-                                }
+                                MissType::Normal => {}
                                 MissType::ForcedRecache => {
-                                    stats.cache_misses += 1;
                                     stats.forced_recaches += 1;
                                 }
                                 MissType::TimedOut => {
-                                    stats.cache_misses += 1;
                                     stats.cache_timeouts += 1;
                                 }
+                                MissType::CacheReadError => {
+                                    stats.cache_errors += 1;
+                                }
                             }
+                            stats.cache_misses += 1;
                             stats.cache_read_miss_duration += duration;
                             cache_write = Some(future);
                         }
@@ -600,15 +617,20 @@ impl<C> SccacheService<C>
                     res.stderr = output.stderr;
                 }
                 Err(err) => {
-                    debug!("[{:?}] compilation failed: {:?}",
-                           err,
-                           output);
+                    use std::fmt::Write;
+
+                    error!("[{:?}] fatal error: {}", out_pretty, err);
+
+                    let mut error = format!("sccache: encountered fatal error\n");
+                    drop(writeln!(error, "sccache: error : {}", err));
                     for e in err.iter() {
-                        error!("[{:?}] \t{}", e, output);
+                        error!("[{:?}] \t{}", out_pretty, e);
+                        drop(writeln!(error, "sccache:  cause: {}", e));
                     }
                     stats.cache_errors += 1;
                     //TODO: figure out a better way to communicate this?
                     res.retcode = Some(-2);
+                    res.stderr = error.into_bytes();
                 }
             };
             let send = tx.send(Ok(Response::CompileFinished(res)));
@@ -622,7 +644,9 @@ impl<C> SccacheService<C>
                     }
                     //TODO: save cache stats!
                     Ok(Some(info)) => {
-                        debug!("[{}]: Cache write finished in {}", info.object_file, fmt_duration_as_secs(&info.duration));
+                        debug!("[{}]: Cache write finished in {}",
+                               info.object_file_pretty,
+                               fmt_duration_as_secs(&info.duration));
                         me.stats.borrow_mut().cache_writes += 1;
                         me.stats.borrow_mut().cache_write_duration += info.duration;
                     }
@@ -660,6 +684,8 @@ pub struct ServerStats {
     pub cache_misses: u64,
     /// The count of cache misses because the cache took too long to respond.
     pub cache_timeouts: u64,
+    /// The count of errors reading cache entries.
+    pub cache_read_errors: u64,
     /// The count of compilations which were successful but couldn't be cached.
     pub non_cacheable_compilations: u64,
     /// The count of compilations which forcibly ignored the cache.
@@ -683,8 +709,8 @@ pub struct ServerStats {
 pub struct ServerInfo {
     pub stats: ServerStats,
     pub cache_location: String,
-    pub cache_size: Option<usize>,
-    pub max_cache_size: Option<usize>,
+    pub cache_size: Option<u64>,
+    pub max_cache_size: Option<u64>,
 }
 
 impl Default for ServerStats {
@@ -699,6 +725,7 @@ impl Default for ServerStats {
             cache_hits: u64::default(),
             cache_misses: u64::default(),
             cache_timeouts: u64::default(),
+            cache_read_errors: u64::default(),
             non_cacheable_compilations: u64::default(),
             forced_recaches: u64::default(),
             cache_write_errors: u64::default(),
@@ -742,6 +769,7 @@ impl ServerStats {
         set_stat!(stats_vec, self.cache_hits, "Cache hits");
         set_stat!(stats_vec, self.cache_misses, "Cache misses");
         set_stat!(stats_vec, self.cache_timeouts, "Cache timeouts");
+        set_stat!(stats_vec, self.cache_read_errors, "Cache read errors");
         set_stat!(stats_vec, self.forced_recaches, "Forced recaches");
         set_stat!(stats_vec, self.cache_write_errors, "Cache write errors");
         set_stat!(stats_vec, self.compile_fails, "Compilation failures");
@@ -891,7 +919,7 @@ impl<I: AsyncRead + AsyncWrite + 'static> Transport for SccacheTransport<I> {}
 struct ShutdownOrInactive {
     rx: mpsc::Receiver<ServerMessage>,
     handle: Handle,
-    timeout: Timeout,
+    timeout: Option<Timeout>,
     timeout_dur: Duration,
 }
 
@@ -906,13 +934,18 @@ impl Future for ShutdownOrInactive {
                 // Shutdown received!
                 Async::Ready(Some(ServerMessage::Shutdown)) => return Ok(().into()),
                 Async::Ready(Some(ServerMessage::Request)) => {
-                    self.timeout = Timeout::new(self.timeout_dur, &self.handle)?;
+                    if self.timeout_dur != Duration::new(0, 0) {
+                        self.timeout = Some(Timeout::new(self.timeout_dur, &self.handle)?);
+                    }
                 }
                 // All services have shut down, in theory this isn't possible...
                 Async::Ready(None) => return Ok(().into()),
             }
         }
-        self.timeout.poll()
+        match self.timeout {
+            None => Ok(Async::NotReady),
+            Some(ref mut timeout) => timeout.poll(),
+        }
     }
 }
 
@@ -955,7 +988,7 @@ impl Drop for ActiveInfo {
         info.active -= 1;
         if info.active == 0 {
             if let Some(task) = info.blocker.take() {
-                task.unpark();
+                task.notify();
             }
         }
     }
@@ -970,7 +1003,7 @@ impl Future for WaitUntilZero {
         if info.active == 0 {
             Ok(().into())
         } else {
-            info.blocker = Some(task::park());
+            info.blocker = Some(task::current());
             Ok(Async::NotReady)
         }
     }

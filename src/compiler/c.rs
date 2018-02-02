@@ -16,14 +16,14 @@ use compiler::{Cacheable, Compiler, CompilerArguments, CompilerHasher, CompilerK
 use futures::Future;
 use futures_cpupool::CpuPool;
 use mock_command::CommandCreatorSync;
-use sha1;
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::ffi::{OsStr, OsString};
 use std::fmt;
-use std::path::Path;
+use std::hash::Hash;
+use std::path::{Path, PathBuf};
 use std::process;
-use util::{os_str_bytes, sha1_digest};
+use util::{HashToDigest, Digest};
 
 use errors::*;
 
@@ -32,7 +32,7 @@ use errors::*;
 pub struct CCompiler<I>
     where I: CCompilerImpl,
 {
-    executable: String,
+    executable: PathBuf,
     executable_digest: String,
     compiler: I,
 }
@@ -43,9 +43,17 @@ pub struct CCompilerHasher<I>
     where I: CCompilerImpl,
 {
     parsed_args: ParsedArguments,
-    executable: String,
+    executable: PathBuf,
     executable_digest: String,
     compiler: I,
+}
+
+#[derive(Debug, PartialEq, Clone, Copy)]
+pub enum Language {
+    C,
+    Cxx,
+    ObjectiveC,
+    ObjectiveCxx,
 }
 
 /// The results of parsing a compiler commandline.
@@ -53,33 +61,58 @@ pub struct CCompilerHasher<I>
 #[derive(Debug, PartialEq, Clone)]
 pub struct ParsedArguments {
     /// The input source file.
-    pub input: String,
-    /// The file extension of the input source file.
-    pub extension: String,
+    pub input: PathBuf,
+    /// The type of language used in the input source file.
+    pub language: Language,
     /// The file in which to generate dependencies.
-    pub depfile: Option<String>,
+    pub depfile: Option<PathBuf>,
     /// Output files, keyed by a simple name, like "obj".
-    pub outputs: HashMap<&'static str, String>,
+    pub outputs: HashMap<&'static str, PathBuf>,
     /// Commandline arguments for the preprocessor.
-    pub preprocessor_args: Vec<String>,
+    pub preprocessor_args: Vec<OsString>,
     /// Commandline arguments for the preprocessor or the compiler.
-    pub common_args: Vec<String>,
+    pub common_args: Vec<OsString>,
     /// Whether or not the `-showIncludes` argument is passed on MSVC
     pub msvc_show_includes: bool,
 }
 
 impl ParsedArguments {
-    pub fn output_file(&self) -> Cow<str> {
-        self.outputs.get("obj").and_then(|o| Path::new(o).file_name().map(|f| f.to_string_lossy())).unwrap_or(Cow::Borrowed("Unknown filename"))
+    pub fn output_pretty(&self) -> Cow<str> {
+        self.outputs.get("obj")
+            .and_then(|o| o.file_name())
+            .map(|s| s.to_string_lossy())
+            .unwrap_or(Cow::Borrowed("Unknown filename"))
+    }
+}
+
+impl Language {
+    pub fn from_file_name(file: &Path) -> Option<Self> {
+        match file.extension().and_then(|e| e.to_str()) {
+            Some("c") => Some(Language::C),
+            Some("cc") | Some("cpp") | Some("cxx") => Some(Language::Cxx),
+            Some("m") => Some(Language::ObjectiveC),
+            Some("mm") => Some(Language::ObjectiveCxx),
+            e => {
+                trace!("Unknown source extension: {}", e.unwrap_or("(None)"));
+                None
+            }
+        }
+    }
+
+    pub fn as_str(&self) -> &'static str {
+        match *self {
+            Language::C => "c",
+            Language::Cxx => "c++",
+            Language::ObjectiveC => "objc",
+            Language::ObjectiveCxx => "objc++",
+        }
     }
 }
 
 /// A generic implementation of the `Compilation` trait for C/C++ compilers.
 struct CCompilation<I: CCompilerImpl> {
     parsed_args: ParsedArguments,
-    executable: String,
-    /// The output from running the preprocessor.
-    preprocessor_result: process::Output,
+    executable: PathBuf,
     compiler: I,
 }
 
@@ -100,27 +133,24 @@ pub trait CCompilerImpl: Clone + fmt::Debug + Send + 'static {
     fn kind(&self) -> CCompilerKind;
     /// Determine whether `arguments` are supported by this compiler.
     fn parse_arguments(&self,
-                       arguments: &[String],
+                       arguments: &[OsString],
                        cwd: &Path) -> CompilerArguments<ParsedArguments>;
     /// Run the C preprocessor with the specified set of arguments.
     fn preprocess<T>(&self,
                      creator: &T,
-                     executable: &str,
+                     executable: &Path,
                      parsed_args: &ParsedArguments,
-                     cwd: &str,
-                     env_vars: &[(OsString, OsString)],
-                     pool: &CpuPool)
+                     cwd: &Path,
+                     env_vars: &[(OsString, OsString)])
                      -> SFuture<process::Output> where T: CommandCreatorSync;
     /// Run the C compiler with the specified set of arguments, using the
     /// previously-generated `preprocessor_output` as input if possible.
     fn compile<T>(&self,
                   creator: &T,
-                  executable: &str,
-                  preprocessor_result: process::Output,
+                  executable: &Path,
                   parsed_args: &ParsedArguments,
-                  cwd: &str,
-                  env_vars: &[(OsString, OsString)],
-                  pool: &CpuPool)
+                  cwd: &Path,
+                  env_vars: &[(OsString, OsString)])
                   -> SFuture<(Cacheable, process::Output)>
         where T: CommandCreatorSync;
 }
@@ -128,9 +158,9 @@ pub trait CCompilerImpl: Clone + fmt::Debug + Send + 'static {
 impl <I> CCompiler<I>
     where I: CCompilerImpl,
 {
-    pub fn new(compiler: I, executable: String, pool: &CpuPool) -> SFuture<CCompiler<I>>
+    pub fn new(compiler: I, executable: PathBuf, pool: &CpuPool) -> SFuture<CCompiler<I>>
     {
-        Box::new(sha1_digest(executable.clone(), &pool).map(move |digest| {
+        Box::new(Digest::file(executable.clone(), &pool).map(move |digest| {
             CCompiler {
                 executable: executable,
                 executable_digest: digest,
@@ -143,7 +173,7 @@ impl <I> CCompiler<I>
 impl<T: CommandCreatorSync, I: CCompilerImpl> Compiler<T> for CCompiler<I> {
     fn kind(&self) -> CompilerKind { CompilerKind::C(self.compiler.kind()) }
     fn parse_arguments(&self,
-                       arguments: &[String],
+                       arguments: &[OsString],
                        cwd: &Path) -> CompilerArguments<Box<CompilerHasher<T> + 'static>> {
         match self.compiler.parse_arguments(arguments, cwd) {
             CompilerArguments::Ok(args) => {
@@ -170,26 +200,26 @@ impl<T, I> CompilerHasher<T> for CCompilerHasher<I>
 {
     fn generate_hash_key(self: Box<Self>,
                          creator: &T,
-                         cwd: &str,
+                         cwd: &Path,
                          env_vars: &[(OsString, OsString)],
-                         pool: &CpuPool)
+                         _pool: &CpuPool)
                          -> SFuture<HashResult<T>>
     {
         let me = *self;
         let CCompilerHasher { parsed_args, executable, executable_digest, compiler } = me;
-        let result = compiler.preprocess(creator, &executable, &parsed_args, cwd, env_vars, pool);
-        let out_file = parsed_args.output_file().into_owned();
+        let result = compiler.preprocess(creator, &executable, &parsed_args, cwd, env_vars);
+        let out_pretty = parsed_args.output_pretty().into_owned();
         let env_vars = env_vars.to_vec();
         let result = result.map_err(move |e| {
-            debug!("[{}]: preprocessor failed: {:?}", out_file, e);
+            debug!("[{}]: preprocessor failed: {:?}", out_pretty, e);
             e
         });
-        let out_file = parsed_args.output_file().into_owned();
+        let out_pretty = parsed_args.output_pretty().into_owned();
         Box::new(result.or_else(move |err| {
             match err {
                 Error(ErrorKind::ProcessError(output), _) => {
                     debug!("[{}]: preprocessor returned error status {:?}",
-                           out_file,
+                           out_pretty,
                            output.status.code());
                     // Drop the stdout since it's the preprocessor output, just hand back stderr and
                     // the exit status.
@@ -202,33 +232,30 @@ impl<T, I> CompilerHasher<T> for CCompilerHasher<I>
             }
         }).and_then(move |preprocessor_result| {
             trace!("[{}]: Preprocessor output is {} bytes",
-                   parsed_args.output_file(),
+                   parsed_args.output_pretty(),
                    preprocessor_result.stdout.len());
 
-            // Remove object file from arguments before hash calculation
             let key = {
-                let out_file = parsed_args.output_file();
-                let arguments = parsed_args.common_args.iter()
-                    .filter(|a| **a != out_file)
-                    .map(|a| a.as_str())
-                    .collect::<String>();
-                hash_key(&executable_digest, &arguments, &env_vars, &preprocessor_result.stdout)
+                hash_key(&executable_digest,
+                         parsed_args.language,
+                         &parsed_args.common_args,
+                         &env_vars,
+                         &preprocessor_result.stdout)
             };
             Ok(HashResult {
                 key: key,
                 compilation: Box::new(CCompilation {
                     parsed_args: parsed_args,
                     executable: executable,
-                    preprocessor_result: preprocessor_result,
                     compiler: compiler,
                 }),
             })
         }))
     }
 
-    fn output_file(&self) -> Cow<str>
+    fn output_pretty(&self) -> Cow<str>
     {
-        self.parsed_args.output_file()
+        self.parsed_args.output_pretty()
     }
 
     fn box_clone(&self) -> Box<CompilerHasher<T>>
@@ -240,52 +267,56 @@ impl<T, I> CompilerHasher<T> for CCompilerHasher<I>
 impl<T: CommandCreatorSync, I: CCompilerImpl> Compilation<T> for CCompilation<I> {
     fn compile(self: Box<Self>,
                creator: &T,
-               cwd: &str,
-               env_vars: &[(OsString, OsString)],
-               pool: &CpuPool)
+               cwd: &Path,
+               env_vars: &[(OsString, OsString)])
                -> SFuture<(Cacheable, process::Output)>
     {
         let me = *self;
-        let CCompilation { parsed_args, executable, preprocessor_result, compiler } = me;
-        compiler.compile(creator, &executable, preprocessor_result, &parsed_args, cwd, env_vars,
-                         pool)
+        let CCompilation { parsed_args, executable, compiler } = me;
+        compiler.compile(creator, &executable, &parsed_args, cwd, env_vars)
     }
 
-    fn outputs<'a>(&'a self) -> Box<Iterator<Item=(&'a str, &'a String)> + 'a>
+    fn outputs<'a>(&'a self) -> Box<Iterator<Item=(&'a str, &'a Path)> + 'a>
     {
-        Box::new(self.parsed_args.outputs.iter().map(|(k, v)| (*k, v)))
+        Box::new(self.parsed_args.outputs.iter().map(|(k, v)| (*k, &**v)))
     }
 }
 
 /// The cache is versioned by the inputs to `hash_key`.
-pub const CACHE_VERSION : &'static [u8] = b"3";
+pub const CACHE_VERSION: &[u8] = b"6";
 
-/// Environment variables that are factored into the cache key.
-pub const CACHED_ENV_VARS : &'static [&'static str] = &[
-    "MACOSX_DEPLOYMENT_TARGET",
-    "IPHONEOS_DEPLOYMENT_TARGET",
-];
+lazy_static! {
+    /// Environment variables that are factored into the cache key.
+    static ref CACHED_ENV_VARS: HashSet<&'static OsStr> = [
+        "MACOSX_DEPLOYMENT_TARGET",
+        "IPHONEOS_DEPLOYMENT_TARGET",
+    ].iter().map(OsStr::new).collect();
+}
 
 /// Compute the hash key of `compiler` compiling `preprocessor_output` with `args`.
-pub fn hash_key(compiler_digest: &str, arguments: &str, env_vars: &[(OsString, OsString)],
+pub fn hash_key(compiler_digest: &str,
+                language: Language,
+                arguments: &[OsString],
+                env_vars: &[(OsString, OsString)],
                 preprocessor_output: &[u8]) -> String
 {
     // If you change any of the inputs to the hash, you should change `CACHE_VERSION`.
-    let mut m = sha1::Sha1::new();
+    let mut m = Digest::new();
     m.update(compiler_digest.as_bytes());
     m.update(CACHE_VERSION);
-    m.update(arguments.as_bytes());
-    //TODO: use lazy_static.
-    let cached_env_vars: HashSet<OsString> = CACHED_ENV_VARS.iter().map(|v| OsStr::new(v).to_os_string()).collect();
+    m.update(language.as_str().as_bytes());
+    for arg in arguments {
+        arg.hash(&mut HashToDigest { digest: &mut m });
+    }
     for &(ref var, ref val) in env_vars.iter() {
-        if cached_env_vars.contains(var) {
-            m.update(os_str_bytes(var));
+        if CACHED_ENV_VARS.contains(var.as_os_str()) {
+            var.hash(&mut HashToDigest { digest: &mut m });
             m.update(&b"="[..]);
-            m.update(os_str_bytes(val));
+            val.hash(&mut HashToDigest { digest: &mut m });
         }
     }
     m.update(preprocessor_output);
-    m.digest().to_string()
+    m.finish()
 }
 
 #[cfg(test)]
@@ -294,44 +325,48 @@ mod test {
 
     #[test]
     fn test_hash_key_executable_contents_differs() {
-        let args = "a b c";
+        let args = ovec!["a", "b", "c"];
         const PREPROCESSED : &'static [u8] = b"hello world";
-        assert_neq!(hash_key("abcd", &args, &[], &PREPROCESSED),
-                    hash_key("wxyz", &args, &[], &PREPROCESSED));
+        assert_neq!(hash_key("abcd", Language::C, &args, &[], &PREPROCESSED),
+                    hash_key("wxyz", Language::C, &args, &[], &PREPROCESSED));
     }
 
     #[test]
     fn test_hash_key_args_differs() {
         let digest = "abcd";
+        let abc = ovec!["a", "b", "c"];
+        let xyz = ovec!["x", "y", "z"];
+        let ab = ovec!["a", "b"];
+        let a = ovec!["a"];
         const PREPROCESSED: &'static [u8] = b"hello world";
-        assert_neq!(hash_key(digest, "a b c", &[], &PREPROCESSED),
-                    hash_key(digest, "x y z", &[], &PREPROCESSED));
+        assert_neq!(hash_key(digest, Language::C, &abc, &[], &PREPROCESSED),
+                    hash_key(digest, Language::C, &xyz, &[], &PREPROCESSED));
 
-        assert_neq!(hash_key(digest, "a b c", &[], &PREPROCESSED),
-                    hash_key(digest, "a b", &[], &PREPROCESSED));
+        assert_neq!(hash_key(digest, Language::C, &abc, &[], &PREPROCESSED),
+                    hash_key(digest, Language::C, &ab, &[], &PREPROCESSED));
 
-        assert_neq!(hash_key(digest, "a b c", &[], &PREPROCESSED),
-                    hash_key(digest, "a", &[], &PREPROCESSED));
+        assert_neq!(hash_key(digest, Language::C, &abc, &[], &PREPROCESSED),
+                    hash_key(digest, Language::C, &a, &[], &PREPROCESSED));
     }
 
     #[test]
     fn test_hash_key_preprocessed_content_differs() {
-        let args = "a b c";
-        assert_neq!(hash_key("abcd", &args, &[], &b"hello world"[..]),
-                    hash_key("abcd", &args, &[], &b"goodbye"[..]));
+        let args = ovec!["a", "b", "c"];
+        assert_neq!(hash_key("abcd", Language::C, &args, &[], &b"hello world"[..]),
+                    hash_key("abcd", Language::C, &args, &[], &b"goodbye"[..]));
     }
 
     #[test]
     fn test_hash_key_env_var_differs() {
-        let args = "a b c";
+        let args = ovec!["a", "b", "c"];
         let digest = "abcd";
         const PREPROCESSED: &'static [u8] = b"hello world";
         for var in CACHED_ENV_VARS.iter() {
-            let h1 = hash_key(digest, &args, &[], &PREPROCESSED);
+            let h1 = hash_key(digest, Language::C, &args, &[], &PREPROCESSED);
             let vars = vec![(OsString::from(var), OsString::from("something"))];
-            let h2 = hash_key(digest, &args, &vars, &PREPROCESSED);
+            let h2 = hash_key(digest, Language::C, &args, &vars, &PREPROCESSED);
             let vars = vec![(OsString::from(var), OsString::from("something else"))];
-            let h3 = hash_key(digest, &args, &vars, &PREPROCESSED);
+            let h3 = hash_key(digest, Language::C, &args, &vars, &PREPROCESSED);
             assert_neq!(h1, h2);
             assert_neq!(h2, h3);
         }

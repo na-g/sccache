@@ -12,7 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#![recursion_limit="128"]
+
 extern crate app_dirs;
+extern crate base64;
 extern crate bincode;
 extern crate byteorder;
 #[cfg(feature = "chrono")]
@@ -34,8 +37,12 @@ extern crate futures_cpupool;
 extern crate hyper;
 #[cfg(feature = "hyper-tls")]
 extern crate hyper_tls;
+#[cfg(feature = "jsonwebtoken")]
+extern crate jsonwebtoken as jwt;
 #[cfg(windows)]
 extern crate kernel32;
+#[macro_use]
+extern crate lazy_static;
 extern crate local_encoding;
 #[macro_use]
 extern crate log;
@@ -44,20 +51,25 @@ extern crate fern;
 #[cfg(test)]
 extern crate itertools;
 extern crate libc;
+#[cfg(feature = "memcached")]
+extern crate memcached;
 #[cfg(windows)]
 extern crate mio_named_pipes;
+extern crate native_tls;
+extern crate num_cpus;
 extern crate number_prefix;
+#[cfg(feature = "openssl")]
+extern crate openssl;
+extern crate ring;
 #[cfg(feature = "redis")]
 extern crate redis;
 extern crate regex;
 extern crate retry;
-extern crate rustc_serialize;
-#[cfg(feature = "serde_json")]
 extern crate serde_json;
 #[macro_use]
 extern crate serde_derive;
-extern crate sha1;
 extern crate tempdir;
+extern crate tempfile;
 extern crate time;
 extern crate tokio_core;
 extern crate tokio_io;
@@ -65,6 +77,8 @@ extern crate tokio_process;
 extern crate tokio_proto;
 extern crate tokio_service;
 extern crate tokio_serde_bincode;
+#[cfg(feature = "gcs")]
+extern crate url;
 extern crate uuid;
 #[cfg(windows)]
 extern crate winapi;
@@ -84,6 +98,7 @@ mod client;
 mod cmdline;
 mod commands;
 mod compiler;
+mod jobserver;
 mod mock_command;
 mod protocol;
 mod server;
