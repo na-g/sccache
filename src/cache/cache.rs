@@ -30,6 +30,7 @@ use futures_cpupool::CpuPool;
 use regex::Regex;
 #[cfg(feature = "gcs")]
 use serde_json;
+use cache::inmem::InMemCache;
 use std::env;
 use std::fmt;
 use std::io::{
@@ -309,7 +310,9 @@ pub fn storage_from_environment(pool: &CpuPool, _handle: &Handle) -> Arc<Storage
             }
         }
     }
-
+    if let Ok(_unused) = env::var("SCCACHE_IN_MEM") {
+        return Arc::new(InMemCache::new());
+    }
     let d = env::var_os("SCCACHE_DIR")
         .map(|p| PathBuf::from(p))
         .or_else(|| app_dir(AppDataType::UserCache, &APP_INFO, "").ok())

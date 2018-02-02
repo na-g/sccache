@@ -22,5 +22,5 @@ pub mod redis;
 pub mod s3;
 #[cfg(feature = "gcs")]
 pub mod gcs;
-
+pub mod inmem;
 pub use cache::cache::*;
