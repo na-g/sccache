@@ -77,6 +77,7 @@ impl Storage for InMemCache {
                 store.cache.insert(key.to_owned(), blob);
             }
         }
+
         Box::new(ok(start.elapsed()))
     }
 
